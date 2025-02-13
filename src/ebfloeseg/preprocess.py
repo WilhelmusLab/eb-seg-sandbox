@@ -161,6 +161,8 @@ def _preprocess(
     itmax = itmax
     itmin = itmin
     step = step
+    highest_label_so_far = 0
+
     for r, it in enumerate(range(itmax, itmin - 1, step)):
         # erode a lot at first, decrease number of iterations each time
         eroded_ice_mask = cv2.erode(inp.astype(np.uint8), erosion_kernel, iterations=it)
@@ -171,7 +173,9 @@ def _preprocess(
         )
 
         # label floes remaining after erosion
-        ret, markers = cv2.connectedComponents(eroded_ice_mask.astype(np.uint8))
+        n, markers, _, _ = cv2.connectedComponentsWithStats(
+            eroded_ice_mask.astype(np.uint8)
+        )
 
         # Add one to all labels so that sure background is not 0, but 1
         markers = markers + 1
@@ -199,7 +203,6 @@ def _preprocess(
             )
         ] = 1
 
-        # pdb.set_trace()
         # set the open water and already identified floes to no
         # watershed[~input_no] = 1
         mask_image(watershed, ~input_no, 1)
@@ -228,10 +231,15 @@ def _preprocess(
         input_no = ice_mask + inp
         inp = (watershed == 1) & (inp == 1) & ice_mask
         watershed[watershed < 2] = 0
-        output += watershed
+        new_label_mask = watershed > 0
+        output[new_label_mask] = watershed[new_label_mask] + highest_label_so_far
+        highest_label_so_far = np.max(output)
+
+    # Clean the final props
+    output = opening(output)
+    output = clean_labels_with_multiple_blobs(output)
 
     # saving the props table
-    output = opening(output)
     fname_infix = ""
     if sat:
         fname_infix = f"{sat}_{fname_infix}"
@@ -262,6 +270,52 @@ def _preprocess(
         dtype=smallest_dtype(output),
         res=res,
     )
+
+
+def count_blobs_per_label(label_array):
+    df = pd.DataFrame({"label": [], "count": []})
+    for label in np.unique(label_array):
+        mask = label == label_array
+        _, count = skimage.measure.label(mask, return_num=True)
+        df = pd.concat([df, pd.DataFrame({"label": [label], "count": [count]})])
+    return df
+
+
+def clean_labels_with_multiple_blobs(label_array, factor_threshold=5):
+    label_array_ = np.copy(label_array)
+    blobs_per_label = count_blobs_per_label(label_array_)
+    for row in blobs_per_label.query("label > 0 & count > 1").itertuples():
+        mask = label_array_ == row.label
+        relabeled, count = skimage.measure.label(mask, return_num=True)
+        assert count > 1
+        relabeled_props = pd.DataFrame(
+            skimage.measure.regionprops_table(relabeled, properties=["label", "area"])
+        )
+        ordered_relabeled_props = relabeled_props.sort_values(
+            by="area", ascending=False
+        )
+        blob_generator = ordered_relabeled_props.itertuples()
+        largest_blob = next(blob_generator)
+        for blob in blob_generator:
+            # Exception if this blob isn't strictly smaller than the largest blob
+            assert (
+                blob.area < largest_blob.area
+            ), "blob %s area %s is not smaller than 'largest_blob' %s with area %s" % (
+                blob.label,
+                blob.area,
+                largest_blob.label,
+                largest_blob.area,
+            )
+            # Check that the blob is at least factor_threshold times smaller than the "main" blob
+            # and throw a warning if it isn't
+            if blob.area * factor_threshold > largest_blob.area:
+                logger.warning(
+                    "Blob %s has area %s, larger than 1/%s of largest blob area %s"
+                    % (blob.label, blob.area, factor_threshold, largest_blob.area)
+                )
+            blob_mask = relabeled == blob.label
+            label_array_[blob_mask] = 0
+    return label_array_
 
 
 def preprocess(
